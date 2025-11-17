@@ -1,0 +1,163 @@
+name: Price Monitor
+
+on:
+  schedule:
+    # 매일 오전 9시 (UTC 기준, 뉴질랜드 시간 오후 10시경)에 실행
+    - cron: '0 9 * * *'
+  workflow_dispatch: # 수동 실행 가능
+
+jobs:
+  check-price:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+        
+    - name: Install dependencies
+      run: |
+        pip install requests beautifulsoup4 lxml
+        
+    - name: Check price and send email
+      env:
+        EMAIL_TO: dasider41@gmail.com
+        SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+      run: |
+        python << 'EOF'
+        import requests
+        from bs4 import BeautifulSoup
+        import json
+        import os
+        from datetime import datetime
+
+        # 웹사이트에서 가격 가져오기
+        def get_current_price():
+            url = "https://www.truerewards.co.nz/merchandise/Technology/TC7493"
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            
+            try:
+                response = requests.get(url, headers=headers, timeout=10)
+                response.raise_for_status()
+                soup = BeautifulSoup(response.content, 'html.parser')
+                
+                # 가격 찾기 (웹사이트 구조에 따라 수정 필요)
+                price_element = soup.find('span', class_='price')
+                if not price_element:
+                    price_element = soup.find(string=lambda text: '$' in text if text else False)
+                
+                if price_element:
+                    price_text = price_element.get_text().strip()
+                    # 숫자만 추출
+                    price = float(''.join(filter(lambda x: x.isdigit() or x == '.', price_text)))
+                    return price
+                return None
+            except Exception as e:
+                print(f"Error fetching price: {e}")
+                return None
+
+        # 이전 가격 불러오기
+        def load_previous_price():
+            try:
+                with open('price_history.json', 'r') as f:
+                    data = json.load(f)
+                    return data.get('price')
+            except FileNotFoundError:
+                return 349.00  # 초기 가격
+
+        # 가격 저장
+        def save_price(price):
+            data = {
+                'price': price,
+                'last_checked': datetime.now().isoformat()
+            }
+            with open('price_history.json', 'w') as f:
+                json.dump(data, f)
+
+        # SendGrid로 이메일 보내기
+        def send_email(old_price, new_price):
+            api_key = os.environ.get('SENDGRID_API_KEY')
+            if not api_key:
+                print("SendGrid API key not found")
+                return
+            
+            email_to = os.environ.get('EMAIL_TO')
+            
+            data = {
+                "personalizations": [{
+                    "to": [{"email": email_to}],
+                    "subject": "🔔 가격 변동 알림 - True Rewards"
+                }],
+                "from": {"email": "noreply@github.com"},
+                "content": [{
+                    "type": "text/html",
+                    "value": f"""
+                    <h2>가격이 변경되었습니다!</h2>
+                    <p><strong>제품:</strong> True Rewards TC7493</p>
+                    <p><strong>이전 가격:</strong> ${old_price:.2f}</p>
+                    <p><strong>현재 가격:</strong> ${new_price:.2f}</p>
+                    <p><strong>변동:</strong> ${new_price - old_price:.2f}</p>
+                    <p><a href="https://www.truerewards.co.nz/merchandise/Technology/TC7493">제품 보러 가기</a></p>
+                    <p><small>확인 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</small></p>
+                    """
+                }]
+            }
+            
+            headers = {
+                'Authorization': f'Bearer {api_key}',
+                'Content-Type': 'application/json'
+            }
+            
+            try:
+                response = requests.post(
+                    'https://api.sendgrid.com/v3/mail/send',
+                    headers=headers,
+                    json=data
+                )
+                if response.status_code == 202:
+                    print("Email sent successfully")
+                else:
+                    print(f"Failed to send email: {response.status_code}")
+            except Exception as e:
+                print(f"Error sending email: {e}")
+
+        # 메인 로직
+        current_price = get_current_price()
+        
+        if current_price is None:
+            print("Could not fetch current price")
+            exit(1)
+        
+        print(f"Current price: ${current_price:.2f}")
+        
+        previous_price = load_previous_price()
+        print(f"Previous price: ${previous_price:.2f}")
+        
+        if current_price != previous_price:
+            print("Price changed! Sending email...")
+            send_email(previous_price, current_price)
+            save_price(current_price)
+        else:
+            print("Price unchanged")
+            save_price(current_price)
+        
+        EOF
+        
+    - name: Commit price history
+      run: |
+        git config --local user.email "github-actions[bot]@users.noreply.github.com"
+        git config --local user.name "github-actions[bot]"
+        git add -A
+        git diff --quiet && git diff --staged --quiet || git commit -m "Update price history [skip ci]"
+        
+    - name: Push changes
+      uses: ad-m/github-push-action@master
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        branch: ${{ github.ref }}
