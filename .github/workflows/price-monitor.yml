@@ -21,7 +21,9 @@ jobs:
         
     - name: Install dependencies
       run: |
-        pip install requests beautifulsoup4 lxml
+        pip install requests beautifulsoup4 lxml playwright
+        playwright install chromium
+        playwright install-deps
         
     - name: Check price and send email
       env:
@@ -29,37 +31,63 @@ jobs:
         SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
       run: |
         python << 'EOF'
-        import requests
-        from bs4 import BeautifulSoup
         import json
         import os
+        import re
         from datetime import datetime
+        from playwright.sync_api import sync_playwright
+        import requests
 
         # 웹사이트에서 가격 가져오기
         def get_current_price():
             url = "https://www.truerewards.co.nz/merchandise/Technology/TC7493"
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
             
             try:
-                response = requests.get(url, headers=headers, timeout=10)
-                response.raise_for_status()
-                soup = BeautifulSoup(response.content, 'html.parser')
-                
-                # 가격 찾기 (웹사이트 구조에 따라 수정 필요)
-                price_element = soup.find('span', class_='price')
-                if not price_element:
-                    price_element = soup.find(string=lambda text: '$' in text if text else False)
-                
-                if price_element:
-                    price_text = price_element.get_text().strip()
-                    # 숫자만 추출
-                    price = float(''.join(filter(lambda x: x.isdigit() or x == '.', price_text)))
-                    return price
-                return None
+                with sync_playwright() as p:
+                    browser = p.chromium.launch(headless=True)
+                    page = browser.new_page()
+                    
+                    # 페이지 로드
+                    page.goto(url, wait_until='networkidle', timeout=30000)
+                    
+                    # 페이지 내용 가져오기
+                    content = page.content()
+                    
+                    # 가격 패턴 찾기 (TR$, $, NZD 등)
+                    # 예: "349.00", "TR$ 349.00", "$349.00"
+                    price_patterns = [
+                        r'TR\$\s*(\d+\.?\d*)',
+                        r'\$\s*(\d+\.?\d*)',
+                        r'(\d+\.?\d*)\s*points?',
+                        r'price["\s:]+(\d+\.?\d*)',
+                    ]
+                    
+                    for pattern in price_patterns:
+                        matches = re.findall(pattern, content, re.IGNORECASE)
+                        if matches:
+                            # 첫 번째로 찾은 가격 사용
+                            for match in matches:
+                                try:
+                                    price = float(match)
+                                    if 100 < price < 1000:  # 합리적인 가격 범위
+                                        print(f"Found price: ${price:.2f}")
+                                        browser.close()
+                                        return price
+                                except ValueError:
+                                    continue
+                    
+                    # 스크린샷 저장 (디버깅용)
+                    page.screenshot(path='page_screenshot.png')
+                    print("Could not find price in expected format")
+                    print(f"Page title: {page.title()}")
+                    
+                    browser.close()
+                    return None
+                    
             except Exception as e:
                 print(f"Error fetching price: {e}")
+                import traceback
+                traceback.print_exc()
                 return None
 
         # 이전 가격 불러오기
@@ -153,7 +181,8 @@ jobs:
       run: |
         git config --local user.email "github-actions[bot]@users.noreply.github.com"
         git config --local user.name "github-actions[bot]"
-        git add -A
+        git add price_history.json
+        git add page_screenshot.png || true
         git diff --quiet && git diff --staged --quiet || git commit -m "Update price history [skip ci]"
         
     - name: Push changes
